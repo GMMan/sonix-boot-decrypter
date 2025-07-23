@@ -40,14 +40,14 @@ try
     fs.Seek(0x1f8, SeekOrigin.Begin);
     uint tableVersion = br.ReadUInt32();
 
-    bool isOfb;
+    CipherMode aesMode;
     switch (tableVersion)
     {
         case LOADER_TABLE_V2:
-            isOfb = true;
+            aesMode = CipherMode.OFB;
             break;
         case LOADER_TABLE_V3:
-            isOfb = false;
+            aesMode = CipherMode.CBC;
             break;
         default:
             throw new InvalidDataException("Unknown load table version.");
@@ -79,8 +79,10 @@ try
     Array.Reverse(ivBytes);
     ivBytes = aes.EncryptEcb(ivBytes, PaddingMode.None);
 
-    // Set up encryption
+    // Set up decryption
     aes.Key = ReverseArray(aesKey);
+    aes.Mode = CipherMode.ECB; // We apply our own mode operations due to different byte order
+    aes.Padding = PaddingMode.None;
 
     byte[] DecryptData(uint address, int length)
     {
@@ -92,30 +94,31 @@ try
         byte[] data = br.ReadBytes(length);
         int dataLength = data.Length / (aes.BlockSize / 8) * (aes.BlockSize / 8);
 
-        if (isOfb)
-        {
-            // OFB
+        if (aesMode == CipherMode.OFB)
+        { 
+            using ICryptoTransform transform = aes.CreateEncryptor();
             byte[] roundIv = (byte[])ivBytes.Clone();
             for (int i = 0; i < dataLength; i += aes.BlockSize / 8)
             {
-                roundIv = aes.EncryptEcb(roundIv, PaddingMode.None);
+                transform.TransformBlock(roundIv, 0, roundIv.Length, roundIv, 0);
                 for (int j = 0; j < roundIv.Length; ++j)
                 {
                     data[i + j] ^= roundIv[roundIv.Length - 1 - j];
                 }
             }
         }
-        else
+        else if (aesMode == CipherMode.CBC)
         {
-            // CBC
-            const int CHUNK_SIZE = 0x1000; // SNC733x doesn't have enough RAM to decrypt all 0x10000 bytes at the same time
+            using ICryptoTransform transform = aes.CreateDecryptor();
+            const int CHUNK_SIZE = 0x1000; // SNC733x doesn't have enough RAM to decrypt all 0x10000 bytes at once
             for (int i = 0; i < dataLength; i += CHUNK_SIZE)
             {
                 byte[] roundIv = (byte[])ivBytes.Clone();
+                byte[] plaintextBlock = new byte[aes.BlockSize / 8];
                 for (int j = 0; j < CHUNK_SIZE && i + j < dataLength; j += aes.BlockSize / 8)
                 {
-                    byte[] cipherBlock = ReverseArray(data.AsSpan().Slice(i + j, 0x10).ToArray());
-                    byte[] plaintextBlock = aes.DecryptEcb(cipherBlock, PaddingMode.None);
+                    byte[] cipherBlock = ReverseArray(data.AsSpan().Slice(i + j, aes.BlockSize / 8).ToArray());
+                    transform.TransformBlock(cipherBlock, 0, cipherBlock.Length, plaintextBlock, 0);
                     for (int k = 0; k < plaintextBlock.Length; ++k)
                     {
                         plaintextBlock[k] ^= roundIv[k];
@@ -125,6 +128,10 @@ try
                     Buffer.BlockCopy(plaintextBlock, 0, data, i + j, plaintextBlock.Length);
                 }
             }
+        }
+        else
+        {
+            throw new InvalidOperationException("Unsupported mode of operation.");
         }
 
         return data;
@@ -156,6 +163,7 @@ try
         }
 
         // DPD
+        // Note: SNC733x ignores this
         if (dpdCodeLength != 0)
         {
             byte[] dpdCode = DecryptData(dpdCodeAddr, dpdCodeLength);
