@@ -4,6 +4,8 @@ using System.Security.Cryptography;
 const uint SPI_FLASH_ADDR = 0x60000000;
 const uint LOADER_TABLE_V2 = 0x5a5a0002;
 const uint LOADER_TABLE_V3 = 0x5a5a0033;
+const uint ENCRYPTER_PENDING_MARK = 0x5f5f4e45; // "EN__" for auto encrypt
+
 static byte[] ReverseArray(byte[] input)
 {
     input = (byte[])input.Clone();
@@ -39,23 +41,35 @@ try
 
     fs.Seek(0x1f8, SeekOrigin.Begin);
     uint tableVersion = br.ReadUInt32();
-
-    CipherMode aesMode;
-    switch (tableVersion)
+    CipherMode aesMode = tableVersion switch
     {
-        case LOADER_TABLE_V2:
-            aesMode = CipherMode.OFB;
-            break;
-        case LOADER_TABLE_V3:
-            aesMode = CipherMode.CBC;
-            break;
-        default:
-            throw new InvalidDataException("Unknown load table version.");
-    }
+        LOADER_TABLE_V2 => CipherMode.OFB,
+        >= LOADER_TABLE_V3 => CipherMode.CBC,
+        _ => throw new InvalidDataException("Unknown load table version.")
+    };
 
+    bool isEncrypted = true;
+
+    // ENCRYPTED_BOOT_CODE flag check
     fs.Seek(8, SeekOrigin.Begin);
     uint loadCfg = br.ReadUInt32();
     if ((loadCfg & 1) == 0)
+    {
+        isEncrypted = false;
+    }
+
+    // ENCRYPTER.MARK check (not currently encrypted if present)
+    if (isEncrypted && tableVersion >= LOADER_TABLE_V3)
+    {
+        fs.Seek(0x80, SeekOrigin.Begin);
+        uint mark = br.ReadUInt32();
+        if (mark == ENCRYPTER_PENDING_MARK)
+        {
+            isEncrypted = false;
+        }
+    }
+
+    if (!isEncrypted)
     {
         Console.Error.WriteLine("Code not encrypted. Exiting.");
         return 3;
@@ -179,7 +193,7 @@ try
     {
         // ENCRYPTER.MARK
         fs.Seek(0x80, SeekOrigin.Begin);
-        bw.Write(0x5f5f4e45); // "EN__" for auto encrypt
+        bw.Write(ENCRYPTER_PENDING_MARK);
     }
     else
     {
