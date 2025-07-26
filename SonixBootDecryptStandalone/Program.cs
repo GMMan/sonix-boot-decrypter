@@ -2,10 +2,17 @@
 using System.Security.Cryptography;
 
 const uint SPI_FLASH_ADDR = 0x60000000;
-const uint LOADER_TABLE_V2 = 0x5a5a0002;
-const uint LOADER_TABLE_V3 = 0x5a5a0033;
+const uint LOAD_TABLE_V2 = 0x5a5a0002;
+const uint LOAD_TABLE_V3 = 0x5a5a0033;
 const uint ENCRYPTER_PENDING_MARK = 0x5f5f4e45; // "EN__" for auto encrypt
 const int SPI_LOAD_TABLE_SIZE = 0x200;
+string[] LOAD_TABLE_MAGIC_VALUES = [
+    "SNC7320",
+    "SN323200",
+    "SNUR00",
+    "SN98300",
+    "SONIXDEV"
+];
 
 static byte[] ReverseArray(byte[] input)
 {
@@ -41,60 +48,69 @@ try
     BinaryReader br = new(fs);
     BinaryWriter bw = new(fs);
 
-    bool ProcessLoadTable(uint baseOffset, bool isPriorityBoot)
+    bool IsLoadTable(byte[] magic)
     {
-        fs.Seek(baseOffset + 0x1f8, SeekOrigin.Begin);
-        uint tableVersion = br.ReadUInt32();
-        if (tableVersion >> 16 != 0x5a5a) return false;
-
-        CipherMode aesMode = tableVersion switch
+        foreach (var value in LOAD_TABLE_MAGIC_VALUES)
         {
-            LOADER_TABLE_V2 => CipherMode.OFB,
-            >= LOADER_TABLE_V3 => CipherMode.CBC,
-            _ => throw new InvalidDataException("Unknown load table version.")
-        };
-
-        bool isEncrypted = true;
-        bool isRedirectEncrypted = false;
-
-        // ENCRYPTED_BOOT_CODE flag check
-        fs.Seek(baseOffset + 8, SeekOrigin.Begin);
-        uint loadCfg = br.ReadUInt32();
-        if ((loadCfg & 1) == 0)
-        {
-            isEncrypted = false;
-        }
-
-        // ENCRYPTER.MARK check (not currently encrypted if present)
-        if (isEncrypted && tableVersion >= LOADER_TABLE_V3)
-        {
-            fs.Seek(baseOffset + 0x80, SeekOrigin.Begin);
-            uint mark = br.ReadUInt32();
-            if (mark == ENCRYPTER_PENDING_MARK)
+            bool match = true;
+            for (int i = 0; i < value.Length; ++i)
             {
-                isEncrypted = false;
+                if (magic[i] != value[i])
+                {
+                    match = false;
+                    break;
+                }
+            }
+
+            if (match)
+            {
+                return true;
             }
         }
 
+        return false;
+    }
+
+    bool ProcessLoadTable(uint baseOffset, bool isPriorityBoot = false)
+    {
+        fs.Seek(baseOffset, SeekOrigin.Begin);
+        byte[] tableMagic = br.ReadBytes(8);
+        if (!IsLoadTable(tableMagic)) return false;
+
+        fs.Seek(baseOffset + 8, SeekOrigin.Begin);
+        uint loadCfg = br.ReadUInt32();
+
+        fs.Seek(baseOffset + 0x1f8, SeekOrigin.Begin);
+        uint tableVersion = br.ReadUInt32();
+        CipherMode aesMode = tableVersion switch
+        {
+            < LOAD_TABLE_V3 => CipherMode.OFB,
+            >= LOAD_TABLE_V3 => CipherMode.CBC,
+        };
+
         // Load tables processed:
-        // - Normal
-        // - Manual table
         // - Priority boot
         // - Priority boot in manual table
+        // - Manual table
+        // - Normal
+        bool isRedirectEncrypted = false;
 
         // Priority boot does not allow nested redirects
         if (!isPriorityBoot)
         {
+            // Priority boot (redirect to any boot device)
             if (((loadCfg >> 16) & 0xfff) == 0xfff)
             {
-                // Priority boot (redirect to any boot device)
                 // Check that we're still in flash, because this could boot off any other device
                 fs.Seek(baseOffset + 0xc0, SeekOrigin.Begin);
                 uint deviceType = br.ReadUInt32();
                 if (deviceType == 0x1)
                 {
                     uint flashAddr = br.ReadUInt32();
-                    if (flashAddr >= SPI_FLASH_ADDR) flashAddr -= SPI_FLASH_ADDR;
+                    if ((flashAddr | SPI_FLASH_ADDR) == flashAddr)
+                    {
+                        flashAddr -= SPI_FLASH_ADDR;
+                    }
                     isRedirectEncrypted |= ProcessLoadTable(flashAddr, true);
                 }
             }
@@ -102,10 +118,29 @@ try
             // Manual table (redirect within current boot device)
             fs.Seek(baseOffset + 0x68, SeekOrigin.Begin);
             uint manualTableAddress = br.ReadUInt32();
-            if (manualTableAddress >= SPI_FLASH_ADDR)
+            if ((manualTableAddress | SPI_FLASH_ADDR) == manualTableAddress)
             {
                 manualTableAddress -= SPI_FLASH_ADDR;
-                isRedirectEncrypted |= ProcessLoadTable(manualTableAddress, isPriorityBoot);
+                isRedirectEncrypted |= ProcessLoadTable(manualTableAddress);
+            }
+        }
+
+        bool isEncrypted = true;
+
+        // ENCRYPTED_BOOT_CODE flag check
+        if ((loadCfg & 1) == 0)
+        {
+            isEncrypted = false;
+        }
+
+        // ENCRYPTER.MARK check (not currently encrypted if present)
+        if (isEncrypted && tableVersion >= LOAD_TABLE_V3)
+        {
+            fs.Seek(baseOffset + 0x80, SeekOrigin.Begin);
+            uint mark = br.ReadUInt32();
+            if (mark == ENCRYPTER_PENDING_MARK)
+            {
+                isEncrypted = false;
             }
         }
 
@@ -198,7 +233,7 @@ try
         fs.Seek(userCodeAddr - SPI_FLASH_ADDR, SeekOrigin.Begin);
         fs.Write(userCode);
 
-        if (tableVersion == LOADER_TABLE_V2)
+        if (tableVersion == LOAD_TABLE_V2)
         {
             // Process manual load sections (V2-only)
             List<(uint srcAddr, int size)> manualLoadSections = new();
@@ -221,7 +256,7 @@ try
             }
         }
 
-        if (tableVersion >= LOADER_TABLE_V3)
+        if (tableVersion >= LOAD_TABLE_V3)
         {
             // Read extra code locations
             fs.Seek(baseOffset + 0x90, SeekOrigin.Begin);
@@ -249,7 +284,7 @@ try
         }
 
         // Patch encryption flags
-        if (tableVersion >= LOADER_TABLE_V3)
+        if (tableVersion >= LOAD_TABLE_V3)
         {
             // ENCRYPTER.MARK
             fs.Seek(baseOffset + 0x80, SeekOrigin.Begin);
@@ -278,9 +313,13 @@ try
     {
         if (!fromEnd)
         {
-            if (offset + SPI_LOAD_TABLE_SIZE < fs.Length)
+            if (offset + SPI_LOAD_TABLE_SIZE <= fs.Length)
             {
-                isEncrypted |= ProcessLoadTable(offset, false);
+                isEncrypted |= ProcessLoadTable(offset);
+            }
+            else
+            {
+                break;
             }
         }
         else
@@ -288,7 +327,7 @@ try
             offset *= 2;
             if (fs.Length - offset >= 0)
             {
-                isEncrypted |= ProcessLoadTable((uint)(fs.Length - offset), false);
+                isEncrypted |= ProcessLoadTable((uint)(fs.Length - offset));
             }
             else
             {
