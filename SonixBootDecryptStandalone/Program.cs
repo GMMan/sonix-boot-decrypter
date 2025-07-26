@@ -21,6 +21,29 @@ static byte[] ReverseArray(byte[] input)
     return input;
 }
 
+bool IsLoadTable(byte[] magic)
+{
+    foreach (var value in LOAD_TABLE_MAGIC_VALUES)
+    {
+        bool match = true;
+        for (int i = 0; i < value.Length; ++i)
+        {
+            if (magic[i] != value[i])
+            {
+                match = false;
+                break;
+            }
+        }
+
+        if (match)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 if (args.Length < 2)
 {
     Console.Error.WriteLine($"Usage: {Environment.GetCommandLineArgs()[0]} <deviceKey> <inPath> [outPath]");
@@ -47,29 +70,6 @@ try
     if (fs.Length < SPI_LOAD_TABLE_SIZE) throw new InvalidDataException("File too small.");
     BinaryReader br = new(fs);
     BinaryWriter bw = new(fs);
-
-    bool IsLoadTable(byte[] magic)
-    {
-        foreach (var value in LOAD_TABLE_MAGIC_VALUES)
-        {
-            bool match = true;
-            for (int i = 0; i < value.Length; ++i)
-            {
-                if (magic[i] != value[i])
-                {
-                    match = false;
-                    break;
-                }
-            }
-
-            if (match)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
 
     bool ProcessLoadTable(uint baseOffset, bool isPriorityBoot = false)
     {
