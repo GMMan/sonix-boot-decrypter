@@ -11,7 +11,8 @@ string[] LOAD_TABLE_MAGIC_VALUES = [
     "SN323200",
     "SNUR00",
     "SN98300",
-    "SONIXDEV"
+    "SONIXDEV",
+    "SNCSPINF",
 ];
 
 static byte[] ReverseArray(byte[] input)
@@ -104,7 +105,7 @@ try
                 // Check that we're still in flash, because this could boot off any other device
                 fs.Seek(baseOffset + 0xc0, SeekOrigin.Begin);
                 uint deviceType = br.ReadUInt32();
-                if (deviceType == 0x1)
+                if (deviceType == 0x01 || deviceType == 0x08)
                 {
                     uint flashAddr = br.ReadUInt32();
                     if ((flashAddr | SPI_FLASH_ADDR) == flashAddr)
