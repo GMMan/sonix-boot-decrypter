@@ -1,4 +1,6 @@
 ﻿// See https://aka.ms/new-console-template for more information
+using System.Buffers.Binary;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 
 const uint SPI_FLASH_ADDR = 0x60000000;
@@ -14,13 +16,6 @@ string[] LOAD_TABLE_MAGIC_VALUES = [
     "SONIXDEV",
     "SNCSPINF",
 ];
-
-static byte[] ReverseArray(byte[] input)
-{
-    input = (byte[])input.Clone();
-    Array.Reverse(input);
-    return input;
-}
 
 bool IsLoadTable(byte[] magic)
 {
@@ -152,26 +147,25 @@ try
 
         fs.Seek(baseOffset + 0x28, SeekOrigin.Begin);
         byte[] aesKey = br.ReadBytes(32);
+        Array.Reverse(aesKey);
 
         // Create IV
         using Aes aes = Aes.Create();
-        aes.Key = ReverseArray(aesKey.AsSpan(0x10, 0x10).ToArray());
-        byte[] ivBytes = aesKey.AsSpan(0x0, 0x10).ToArray();
-        byte[] ivVarBytes = BitConverter.GetBytes(deviceKey);
-        for (int i = 0; i < ivBytes.Length; i += 4)
-        {
-            ivBytes[i] ^= ivVarBytes[0];
-            ivBytes[i + 1] ^= ivVarBytes[1];
-            ivBytes[i + 2] ^= ivVarBytes[2];
-            ivBytes[i + 3] ^= ivVarBytes[3];
-        }
-        Array.Reverse(ivBytes);
+        aes.Key = aesKey.AsSpan(0x0, 0x10).ToArray();
+        byte[] ivBytes = aesKey.AsSpan(0x10, 0x10).ToArray(); // Make a copy
+        Span<uint> ivBytesUInt = MemoryMarshal.Cast<byte, uint>(ivBytes);
+        deviceKey = BinaryPrimitives.ReverseEndianness(deviceKey);
+        ivBytesUInt[0] ^= deviceKey;
+        ivBytesUInt[1] ^= deviceKey;
+        ivBytesUInt[2] ^= deviceKey;
+        ivBytesUInt[3] ^= deviceKey;
         ivBytes = aes.EncryptEcb(ivBytes, PaddingMode.None);
 
         // Set up decryption
-        aes.Key = ReverseArray(aesKey);
-        aes.Mode = CipherMode.ECB; // We apply our own mode operations due to different byte order
-        aes.Padding = PaddingMode.None;
+        aes.Key = aesKey;
+        // Pre-allocated buffers for DecryptData()
+        byte[] roundIv = new byte[ivBytes.Length];
+        byte[] plaintextBlock = new byte[aes.BlockSize / 8];
 
         byte[] DecryptData(uint address, int length)
         {
@@ -181,40 +175,48 @@ try
 
             fs.Seek(address - SPI_FLASH_ADDR, SeekOrigin.Begin);
             byte[] data = br.ReadBytes(length);
+            Span<byte> dataSpan = data.AsSpan();
             int dataLength = data.Length / (aes.BlockSize / 8) * (aes.BlockSize / 8);
+            Span<byte> roundIvSpan = roundIv.AsSpan();
+            Span<uint> roundIvUIntSpan = MemoryMarshal.Cast<byte, uint>(roundIvSpan);
 
             if (aesMode == CipherMode.OFB)
             {
-                using ICryptoTransform transform = aes.CreateEncryptor();
-                byte[] roundIv = (byte[])ivBytes.Clone();
-                for (int i = 0; i < dataLength; i += aes.BlockSize / 8)
+                Span<uint> dataUIntSpan = MemoryMarshal.Cast<byte, uint>(dataSpan);
+                ivBytes.CopyTo(roundIvSpan);
+                for (int i = 0; i < dataLength / 4; i += 4)
                 {
-                    transform.TransformBlock(roundIv, 0, roundIv.Length, roundIv, 0);
-                    for (int j = 0; j < roundIv.Length; ++j)
-                    {
-                        data[i + j] ^= roundIv[roundIv.Length - 1 - j];
-                    }
+                    aes.EncryptEcb(roundIvSpan, roundIvSpan, PaddingMode.None);
+                    dataUIntSpan[i] ^= BinaryPrimitives.ReverseEndianness(roundIvUIntSpan[3]);
+                    dataUIntSpan[i + 1] ^= BinaryPrimitives.ReverseEndianness(roundIvUIntSpan[2]);
+                    dataUIntSpan[i + 2] ^= BinaryPrimitives.ReverseEndianness(roundIvUIntSpan[1]);
+                    dataUIntSpan[i + 3] ^= BinaryPrimitives.ReverseEndianness(roundIvUIntSpan[0]);
                 }
             }
             else if (aesMode == CipherMode.CBC)
             {
-                using ICryptoTransform transform = aes.CreateDecryptor();
                 const int CHUNK_SIZE = 0x1000; // SNC733x doesn't have enough RAM to decrypt all 0x10000 bytes at once
+                int blockLength = aes.BlockSize / 8;
+                Span<byte> plaintextBlockSpan = plaintextBlock.AsSpan();
+                Span<uint> plaintextBlockUIntSpan = MemoryMarshal.Cast<byte, uint>(plaintextBlockSpan);
+
                 for (int i = 0; i < dataLength; i += CHUNK_SIZE)
                 {
-                    byte[] roundIv = (byte[])ivBytes.Clone();
-                    byte[] plaintextBlock = new byte[aes.BlockSize / 8];
-                    for (int j = 0; j < CHUNK_SIZE && i + j < dataLength; j += aes.BlockSize / 8)
+                    ivBytes.CopyTo(roundIvSpan);
+                    for (int j = 0; j < CHUNK_SIZE && i + j < dataLength; j += blockLength)
                     {
-                        byte[] cipherBlock = ReverseArray(data.AsSpan().Slice(i + j, aes.BlockSize / 8).ToArray());
-                        transform.TransformBlock(cipherBlock, 0, cipherBlock.Length, plaintextBlock, 0);
-                        for (int k = 0; k < plaintextBlock.Length; ++k)
-                        {
-                            plaintextBlock[k] ^= roundIv[k];
-                        }
-                        roundIv = cipherBlock;
-                        Array.Reverse(plaintextBlock);
-                        Buffer.BlockCopy(plaintextBlock, 0, data, i + j, plaintextBlock.Length);
+                        var block = dataSpan.Slice(i + j, blockLength);
+                        block.Reverse();
+                        aes.DecryptEcb(block, plaintextBlockSpan, PaddingMode.None);
+
+                        plaintextBlockUIntSpan[0] ^= roundIvUIntSpan[0];
+                        plaintextBlockUIntSpan[1] ^= roundIvUIntSpan[1];
+                        plaintextBlockUIntSpan[2] ^= roundIvUIntSpan[2];
+                        plaintextBlockUIntSpan[3] ^= roundIvUIntSpan[3];
+
+                        block.CopyTo(roundIvSpan);
+                        plaintextBlockSpan.Reverse();
+                        plaintextBlockSpan.CopyTo(block);
                     }
                 }
             }
