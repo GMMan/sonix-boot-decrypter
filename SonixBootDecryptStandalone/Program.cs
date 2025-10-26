@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 
 const uint SPI_FLASH_ADDR = 0x60000000;
+const uint LOAD_TABLE_MAGIC = 0x5a5a0000;
 const uint LOAD_TABLE_V2 = 0x5a5a0002;
 const uint LOAD_TABLE_V3 = 0x5a5a0033;
 const uint ENCRYPTER_PENDING_MARK = 0x5f5f4e45; // "EN__" for auto encrypt
@@ -78,6 +79,7 @@ try
 
         fs.Seek(baseOffset + 0x1f8, SeekOrigin.Begin);
         uint tableVersion = br.ReadUInt32();
+        if ((tableVersion & 0xffff0000) != LOAD_TABLE_MAGIC) return false;
         CipherMode aesMode = tableVersion switch
         {
             < LOAD_TABLE_V3 => CipherMode.OFB,
